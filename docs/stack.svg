@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="350" height="28" viewBox="0 0 350 28" role="img" aria-labelledby="title">
+  <title id="title">Windows · Python 3.13 · PySide6 · FFmpeg</title>
+  <g stroke="#655A3F" fill="#29261E">
+    <rect x=".5" y=".5" width="78" height="27" rx="5"/>
+    <rect x="86.5" y=".5" width="103" height="27" rx="5"/>
+    <rect x="197.5" y=".5" width="73" height="27" rx="5"/>
+    <rect x="278.5" y=".5" width="71" height="27" rx="5"/>
+  </g>
+  <g fill="#E6D7AF" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600" text-anchor="middle">
+    <text x="39.5" y="18">Windows</text>
+    <text x="138" y="18">Python 3.13</text>
+    <text x="234" y="18">PySide6</text>
+    <text x="314" y="18">FFmpeg</text>
+  </g>
+</svg>
