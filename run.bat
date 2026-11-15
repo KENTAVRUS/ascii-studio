@@ -1,5 +1,17 @@
 @echo off
 cd /d "%~dp0"
+if exist "dist\1.3.1\ASCII Studio\ASCII Studio.exe" (
+    start "" "dist\1.3.1\ASCII Studio\ASCII Studio.exe" %*
+    exit /b
+)
+if exist "dist\1.3.0\ASCII Studio\ASCII Studio.exe" (
+    start "" "dist\1.3.0\ASCII Studio\ASCII Studio.exe" %*
+    exit /b
+)
+if exist "dist\1.2.1\ASCII Studio\ASCII Studio.exe" (
+    start "" "dist\1.2.1\ASCII Studio\ASCII Studio.exe" %*
+    exit /b
+)
 if exist "dist\1.2.0\ASCII Studio\ASCII Studio.exe" (
     start "" "dist\1.2.0\ASCII Studio\ASCII Studio.exe" %*
     exit /b

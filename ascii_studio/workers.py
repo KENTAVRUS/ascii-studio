@@ -7,7 +7,8 @@ import cv2
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
 
-from .engine import AsciiRenderer, ExportCancelled, ExportJob, probe_video
+from .engine import AsciiRenderer, ExportCancelled, ExportError, ExportJob, probe_media
+from .media import PictureReader
 from .autotune import AutoTuneCancelled, analyze_video
 
 
@@ -26,7 +27,7 @@ class ProbeWorker(QThread):
 
     def run(self):
         try:
-            self.loaded.emit(probe_video(self.path))
+            self.loaded.emit(probe_media(self.path))
         except Exception as error:
             self.failed.emit(str(error))
 
@@ -76,7 +77,7 @@ class PreviewWorker(QThread):
             self._condition.notify()
 
     def run(self):
-        cap, current_path = None, None
+        cap, picture, current_info = None, None, None
         last_time = -1.0
         renderer = AsciiRenderer()
         try:
@@ -90,12 +91,25 @@ class PreviewWorker(QThread):
                     self._pending = None
                 request_id, info, position, settings, size, playing = request
                 try:
-                    if current_path != info.path:
+                    if current_info is not info:
                         if cap:
                             cap.release()
-                        cap = cv2.VideoCapture(str(info.path))
-                        current_path = info.path
+                            cap = None
+                        if picture:
+                            picture.close()
+                            picture = None
+                        if info.kind in ("image", "gif"):
+                            picture = PictureReader(info)
+                        else:
+                            cap = cv2.VideoCapture(str(info.path))
+                        current_info = info
                         last_time = -1.0
+                    if picture:
+                        rgb = picture.read(position, settings.background, size)
+                        rgb = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
+                        rendered = renderer.render(rgb, settings, size)
+                        self.rendered.emit(request_id, image_from_array(rgb), image_from_array(rendered))
+                        continue
                     target_frame = max(0, min(max(0, info.frames - 1), round(position * info.fps)))
                     next_frame = round(cap.get(cv2.CAP_PROP_POS_FRAMES))
                     if target_frame < next_frame or target_frame - next_frame > 4:
@@ -121,12 +135,15 @@ class PreviewWorker(QThread):
         finally:
             if cap:
                 cap.release()
+            if picture:
+                picture.close()
 
 
 class ExportWorker(QThread):
     progress = Signal(int, int, float)
+    phase = Signal(str)
     completed = Signal(str)
-    failed = Signal(str)
+    failed = Signal(str, str)
     cancelled = Signal()
 
     def __init__(self, info, destination, settings, options, parent=None):
@@ -137,9 +154,11 @@ class ExportWorker(QThread):
 
     def run(self):
         try:
-            result = self.job.run(self.info, self.destination, self.settings, self.options, self.progress.emit)
+            result = self.job.run(self.info, self.destination, self.settings, self.options, self.progress.emit, self.phase.emit)
             self.completed.emit(str(result))
         except ExportCancelled:
             self.cancelled.emit()
+        except ExportError as error:
+            self.failed.emit(str(error), error.details)
         except Exception as error:
-            self.failed.emit(str(error))
+            self.failed.emit(str(error), "")

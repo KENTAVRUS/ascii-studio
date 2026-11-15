@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import math
+import errno
 import os
 import re
 import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable
@@ -16,6 +17,8 @@ import cv2
 import imageio_ffmpeg
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+from .media import IMAGE_FORMATS, VIDEO_FORMATS, MediaInfo as VideoInfo, PictureReader, format_key, probe_picture
 
 
 PALETTES = {
@@ -54,17 +57,6 @@ class RenderSettings:
 
 
 @dataclass(frozen=True)
-class VideoInfo:
-    path: Path
-    width: int
-    height: int
-    fps: float
-    frames: int
-    duration: float
-    has_audio: bool
-
-
-@dataclass(frozen=True)
 class ExportOptions:
     resolution: int = 0  # Long edge of the 16:9 bounding box; auto is capped at UHD.
     fps: float = 0      # Zero keeps the nominal source rate, up to 240 fps.
@@ -72,10 +64,33 @@ class ExportOptions:
     crf: int = 18
     upscale: bool = False
     interpolate: bool = False
+    format: str = ""  # Empty infers the format from the destination suffix.
 
 
 class ExportCancelled(Exception):
     pass
+
+
+class ExportError(RuntimeError):
+    def __init__(self, message: str, details: str = ""):
+        super().__init__(message)
+        self.details = details
+
+
+def describe_export_error(error: Exception, details: str) -> ExportError:
+    diagnostics = details.strip()
+    lower = diagnostics.lower()
+    no_space = "no space left on device" in lower
+    if no_space and "error sending frames to consumers" in lower and "[af#" in lower:
+        message = ("Не удалось синхронизировать звук и видео: переполнена внутренняя очередь обработки звука.\n\n"
+                   "Повторите экспорт. Если ошибка повторяется, попробуйте отключить «Сохранить исходный звук».")
+    elif no_space or (isinstance(error, OSError) and (error.errno == errno.ENOSPC or getattr(error, "winerror", None) == 112)):
+        message = "Недостаточно свободного места для записи видео. Освободите место или выберите папку на другом диске."
+    elif isinstance(error, BrokenPipeError):
+        message = "Кодировщик остановился во время экспорта. Точная причина указана в технических подробностях."
+    else:
+        message = str(error)
+    return ExportError(message, diagnostics or repr(error))
 
 
 def ffmpeg_path() -> str:
@@ -97,21 +112,35 @@ def fit_size(width: int, height: int, long_edge: int = 0, short_edge: float = 0)
     return max(2, int(width * scale) // 2 * 2), max(2, int(height * scale) // 2 * 2)
 
 
-def export_size(width: int, height: int, resolution: int = 0, upscale: bool = False) -> tuple[int, int]:
+def export_size(width: int, height: int, resolution: int = 0, upscale: bool = False, *, even: bool = True) -> tuple[int, int]:
     if not 0 <= resolution <= MAX_EXPORT_LONG_EDGE:
         raise ValueError("Выберите разрешение экспорта до 4K (3840 × 2160).")
     long_edge = resolution or MAX_EXPORT_LONG_EDGE
+    if not even:
+        scale = min(long_edge / max(width, height), long_edge * 9 / 16 / min(width, height))
+        if not upscale or not resolution:
+            scale = min(1, scale)
+        return max(1, round(width * scale)), max(1, round(height * scale))
     if upscale and resolution:
         scale = min(long_edge / max(width, height), long_edge * 9 / 16 / min(width, height))
         return max(2, round(width * scale) // 2 * 2), max(2, round(height * scale) // 2 * 2)
     return fit_size(width, height, long_edge, long_edge * 9 / 16)
 
 
-def export_fps(source_fps: float, requested_fps: float = 0) -> float:
-    fps = requested_fps or min(source_fps, MAX_EXPORT_FPS)
-    if not math.isfinite(fps) or not 0.1 <= fps <= MAX_EXPORT_FPS:
-        raise ValueError("Частота кадров должна быть от 0,1 до 240.")
+def export_fps(source_fps: float, requested_fps: float = 0, format: str = "") -> float:
+    limit = 50 if format == "gif" else MAX_EXPORT_FPS
+    fps = requested_fps or min(source_fps, 30 if format == "gif" else limit)
+    if not math.isfinite(fps) or not 0.1 <= fps <= limit:
+        raise ValueError(f"Частота кадров должна быть от 0,1 до {limit} для этого формата.")
     return fps
+
+
+def audio_export_filter(duration: float) -> str:
+    # Bound audio to the output timeline instead of infinite apad + -shortest.
+    # AAC consumes 1024 samples; normalize input frames to avoid FFmpeg #25878
+    # (ENOSPC from the sync FIFO, unrelated to disk space).
+    return (f"aresample=48000,apad=whole_dur={duration:.9f},"
+            f"atrim=end={duration:.9f},asetnsamples=n=1024:p=0")
 
 
 def validate_duration(duration: float):
@@ -122,14 +151,14 @@ def validate_duration(duration: float):
 
 
 def interpolation_active(info: VideoInfo, options: ExportOptions) -> bool:
-    return options.interpolate and export_fps(info.fps, options.fps) > info.fps + 0.01
+    return options.interpolate and export_fps(info.fps, options.fps, options.format) > info.fps + 0.01
 
 
 def decoder_plan(info: VideoInfo, options: ExportOptions) -> tuple[tuple[int, int], str]:
     """Decode for motion/analysis separately from the final high-resolution glyph raster."""
     output_width, output_height = export_size(info.width, info.height, options.resolution, options.upscale)
     width, height = fit_size(info.width, info.height, max(output_width, output_height), min(output_width, output_height))
-    fps = export_fps(info.fps, options.fps)
+    fps = export_fps(info.fps, options.fps, options.format)
     filters = []
     if interpolation_active(info, options):
         # ASCII uses at most 280 columns. Motion at up to 720p retains ample samples
@@ -143,6 +172,10 @@ def decoder_plan(info: VideoInfo, options: ExportOptions) -> tuple[tuple[int, in
                     f"trim=duration={info.duration:.9f}"]
     else:
         filters += [f"fps={fps:.8f}", f"scale={width}:{height}:flags=area", "setsar=1"]
+        if info.kind == "gif":
+            # The GIF demuxer can infer an overlong final packet; Pillow gives
+            # us the declared single-loop duration, including the last delay.
+            filters += [f"trim=duration={info.duration:.9f}"]
     return (width, height), ",".join(filters)
 
 
@@ -187,6 +220,32 @@ def probe_video(path: str | Path) -> VideoInfo:
     if width < 2 or height < 2 or max(width, height) > 16384:
         raise ValueError("Неподдерживаемый размер кадра.")
     return VideoInfo(path, width, height, fps, frames, duration, "Audio:" in metadata)
+
+
+def probe_media(path: str | Path) -> VideoInfo:
+    path = Path(path).resolve()
+    if not path.is_file():
+        raise ValueError("Файл не найден.")
+    return probe_picture(path) or probe_video(path)
+
+
+def video_encoding_args(format: str, crf: int) -> list[str]:
+    if format == "gif":
+        # Per-frame palettes bound memory; no whole-animation frame cache.
+        return ["-vf", "split[a][b];[a]palettegen=stats_mode=single:reserve_transparent=0[p];"
+                       "[b][p]paletteuse=new=1:dither=bayer:bayer_scale=3", "-loop", "0"]
+    if format == "webm":
+        return ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", str(crf + 10),
+                "-deadline", "good", "-cpu-used", "4", "-row-mt", "1", "-threads", "4", "-pix_fmt", "yuv420p"]
+    if format == "avi":
+        return ["-c:v", "mpeg4", "-q:v", "2", "-bf", "0", "-enc_time_base", "1:60000",
+                "-threads", "4", "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-preset", "fast", "-crf", str(crf), "-threads", "4",
+            "-rc-lookahead", "12", "-pix_fmt", "yuv420p"]
+
+
+def container_args(format: str) -> list[str]:
+    return ["-movflags", "+faststart"] if format in ("mp4", "mov") else []
 
 
 def _font(size: int):
@@ -301,43 +360,97 @@ class ExportJob:
             self._processes.append(process)
             return process
 
+    def _run_image(self, info, target, settings, options, progress):
+        temporary = None
+        started = time.monotonic()
+        try:
+            self._check_cancel()
+            current = probe_media(info.path)
+            if not current.is_image or (current.width, current.height) != (info.width, info.height):
+                raise ValueError("Исходное изображение изменилось. Откройте файл заново.")
+            size = export_size(info.width, info.height, options.resolution, options.upscale, even=False)
+            with PictureReader(info) as reader:
+                rgb = reader.read(background=settings.background, size=size)
+            self._check_cancel()
+            output = AsciiRenderer().render(rgb, settings, size)
+            self._check_cancel()
+            handle, name = tempfile.mkstemp(prefix=f".{target.stem}-", suffix=f".part{target.suffix}", dir=target.parent)
+            os.close(handle)
+            temporary = Path(name)
+            save_options = {"jpg": {"quality": 95, "subsampling": 0, "optimize": True},
+                            "webp": {"lossless": True, "method": 4}, "tiff": {"compression": "tiff_lzw"}}
+            Image.fromarray(output).save(temporary, format=IMAGE_FORMATS[options.format].upper(),
+                                         **save_options.get(options.format, {}))
+            self._check_cancel()
+            os.replace(temporary, target)
+            if progress:
+                progress(1, 1, time.monotonic() - started)
+            return target
+        except OSError as error:
+            raise describe_export_error(error, "") from error
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
     def run(
         self, info: VideoInfo, destination: str | Path, settings: RenderSettings,
         options: ExportOptions = ExportOptions(),
         progress: Callable[[int, int, float], None] | None = None,
+        phase: Callable[[str], None] | None = None,
     ) -> Path:
         target = Path(destination).resolve()
         if target == info.path.resolve():
             raise ValueError("Выберите другое имя: исходное видео нельзя перезаписать.")
-        if target.suffix.lower() != ".mp4":
-            raise ValueError("Экспорт поддерживает формат MP4.")
+        format = format_key(target.suffix)
+        available = IMAGE_FORMATS if info.is_image else VIDEO_FORMATS
+        if format not in available:
+            raise ValueError("Выберите формат изображения." if info.is_image else "Выберите формат видео или GIF.")
+        if options.format and format_key(options.format) != format:
+            raise ValueError("Расширение файла не соответствует выбранному формату экспорта.")
+        options = replace(options, format=format)
         if not target.parent.is_dir():
             raise ValueError("Папка для сохранения не найдена.")
+        if info.is_image:
+            return self._run_image(info, target, settings, options, progress)
         validate_duration(info.duration)
         width, height = export_size(info.width, info.height, options.resolution, options.upscale)
-        fps = export_fps(info.fps, options.fps)
+        fps = export_fps(info.fps, options.fps, format)
         self._check_cancel()
-        current = probe_video(info.path)
+        current = probe_media(info.path)
         if ((current.width, current.height) != (info.width, info.height)
+                or current.kind != info.kind or current.frame_durations != info.frame_durations
                 or abs(current.duration - info.duration) > 0.01 or abs(current.fps - info.fps) > 0.01):
             raise ValueError("Исходное видео изменилось. Откройте его заново перед экспортом.")
         (decode_width, decode_height), video_filter = decoder_plan(info, options)
+        input_options = []
+        if info.kind == "gif":
+            input_options = ["-ignore_loop", "1", "-min_delay", "1", "-default_delay", "10"]
+            r, g, b = hex_rgb(settings.background)
+            video_filter = (f"format=rgba,split[fg][bg];[bg]lutrgb=r={r}:g={g}:b={b}:a=255[solid];"
+                            f"[solid][fg]overlay=shortest=1:format=rgb,{video_filter}")
         fps_arg = f"{fps:.8f}"
         expected = max(1, round(info.duration * fps))
         max_frames = max(1, math.floor(MAX_VIDEO_SECONDS * fps + 1e-6))
-        handle, name = tempfile.mkstemp(prefix=f".{target.stem}-", suffix=".part.mp4", dir=target.parent)
-        os.close(handle)
-        temporary = Path(name)
         renderer = AsciiRenderer()
-        decoder_log = tempfile.TemporaryFile()
-        encoder_log = tempfile.TemporaryFile()
+        with_audio = options.audio and info.has_audio and format != "gif"
+        temporary = video_temporary = decoder_log = encoder_log = muxer_log = None
         started = time.monotonic()
         try:
+            handle, name = tempfile.mkstemp(prefix=f".{target.stem}-", suffix=f".part.{format}", dir=target.parent)
+            os.close(handle)
+            temporary = Path(name)
+            video_temporary = temporary
+            if with_audio:
+                handle, name = tempfile.mkstemp(prefix=f".{target.stem}-", suffix=f".video.part.{format}", dir=target.parent)
+                os.close(handle)
+                video_temporary = Path(name)
+            decoder_log = tempfile.TemporaryFile()
+            encoder_log = tempfile.TemporaryFile()
             self._check_cancel()
             # The fps filter uses timestamps, including variable-frame-rate inputs.
             decoder = self._start([
                 ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-nostdin",
-                "-threads", "4", "-i", str(info.path), "-map", "0:v:0", "-an", "-sn", "-dn",
+                "-threads", "4", *input_options, "-i", str(info.path), "-map", "0:v:0", "-an", "-sn", "-dn",
                 "-vf", video_filter,
                 "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1",
             ], stdout=subprocess.PIPE, stderr=decoder_log, stdin=subprocess.DEVNULL)
@@ -346,17 +459,9 @@ class ExportJob:
                 "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
                 "-r", fps_arg, "-i", "pipe:0",
             ]
-            with_audio = options.audio and info.has_audio
-            if with_audio:
-                args += ["-i", str(info.path)]
-            args += ["-map", "0:v:0"]
-            if with_audio:
-                args += ["-map", "1:a:0", "-c:a", "aac", "-b:a", "192k", "-af", "apad", "-shortest"]
-            args += [
-                "-c:v", "libx264", "-preset", "fast", "-crf", str(options.crf),
-                "-threads", "4", "-rc-lookahead", "12",
-                "-pix_fmt", "yuv420p", "-map_metadata", "-1", "-movflags", "+faststart", str(temporary),
-            ]
+            args += ["-map", "0:v:0", "-an"]
+            args += video_encoding_args(format, options.crf)
+            args += ["-map_metadata", "-1", *container_args(format), str(video_temporary)]
             encoder = self._start(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=encoder_log)
             frame_bytes = decode_width * decode_height * 3
             count = 0
@@ -386,8 +491,29 @@ class ExportJob:
             if encoder.wait(timeout=120) != 0:
                 raise RuntimeError("Не удалось сохранить видео. Проверьте свободное место и доступ к папке.")
             self._check_cancel()
-            if count == 0 or temporary.stat().st_size < 100:
+            if count == 0 or video_temporary.stat().st_size < 100:
                 raise RuntimeError("Видео не содержит кадров для экспорта.")
+            if with_audio:
+                # Add audio only after rendering, with the actual video duration.
+                # This avoids racing audio against a slow raw-video pipe, and
+                # does not trust container duration when audio outlasts video.
+                if phase:
+                    phase("Добавляем звук…")
+                muxer_log = tempfile.TemporaryFile()
+                audio_codec = {"webm": "libopus", "avi": "libmp3lame"}.get(format, "aac")
+                muxer = self._start([
+                    ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                    "-i", str(video_temporary), "-i", str(info.path),
+                    "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+                    "-c:a", audio_codec, "-b:a", "192k", "-af", audio_export_filter(count / fps),
+                    "-map_metadata", "-1", *container_args(format), str(temporary),
+                ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=muxer_log)
+                while muxer.poll() is None:
+                    self._check_cancel()
+                    self.cancelled.wait(0.1)
+                self._check_cancel()
+                if muxer.returncode != 0 or temporary.stat().st_size < 100:
+                    raise RuntimeError("Не удалось добавить звук к видео.")
             # Publish only a complete file; cancellation never destroys an older export.
             os.replace(temporary, target)
             if progress:
@@ -396,12 +522,14 @@ class ExportJob:
         except Exception as error:
             if self.cancelled.is_set():
                 raise ExportCancelled() from error
-            if isinstance(error, (BrokenPipeError, RuntimeError)):
-                encoder_log.seek(0)
-                decoder_log.seek(0)
-                details = (encoder_log.read() + decoder_log.read()).decode("utf-8", errors="replace").strip()
-                if details:
-                    raise RuntimeError(f"{error}\n\n{details[-1600:]}") from error
+            if isinstance(error, (OSError, RuntimeError)):
+                logs = []
+                for log in (muxer_log, encoder_log, decoder_log):
+                    if log is not None:
+                        log.seek(0)
+                        logs.append(log.read())
+                details = b"\n".join(logs).decode("utf-8", errors="replace").strip()
+                raise describe_export_error(error, details[-8000:]) from error
             raise
         finally:
             with self._lock:
@@ -419,6 +547,9 @@ class ExportJob:
                             except OSError:
                                 pass
                 self._processes.clear()
-            decoder_log.close()
-            encoder_log.close()
-            temporary.unlink(missing_ok=True)
+            for log in (decoder_log, encoder_log, muxer_log):
+                if log is not None:
+                    log.close()
+            for path in {temporary, video_temporary}:
+                if path is not None:
+                    path.unlink(missing_ok=True)

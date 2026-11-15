@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from .engine import RenderSettings, VideoInfo, fit_size
+from .media import PictureReader
 
 
 class AutoTuneCancelled(Exception):
@@ -109,6 +110,17 @@ def analyze_video(
     progress: Callable[[int, int], None] | None = None,
 ) -> AutoTuneResult:
     _check_cancel(cancel)
+    if info.kind in ("image", "gif"):
+        count = 1 if info.is_image else min(18, max(6, math.ceil(info.duration / 8)))
+        positions = [0] if info.is_image else np.linspace(0.04, 0.96, count) * info.duration
+        frames = []
+        with PictureReader(info) as reader:
+            for i, position in enumerate(positions):
+                _check_cancel(cancel)
+                frames.append(reader.read(float(position), settings.background, (640, 640)))
+                if progress:
+                    progress(i + 1, count)
+        return suggest_settings(frames, settings, cancel)
     count = min(18, max(6, math.ceil(info.duration / 8)))
     positions = np.linspace(0.04, 0.96, count) * max(0, info.duration - 1 / info.fps)
     cap = cv2.VideoCapture(str(info.path))

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,7 +16,7 @@ from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
-from ascii_studio.engine import NO_WINDOW, ffmpeg_path, probe_video
+from ascii_studio.engine import ExportError, NO_WINDOW, ffmpeg_path, probe_video
 from ascii_studio.theme import configure_app
 from ascii_studio.window import MainWindow
 
@@ -25,7 +26,7 @@ def main():
     configure_app(app)
     window = MainWindow()
     errors = []
-    window._show_error = lambda title, message: errors.append((title, message))
+    window._show_error = lambda title, message, details="": errors.append((title, message, details))
     output = ROOT / "test-output"
     output.mkdir(exist_ok=True)
 
@@ -46,6 +47,7 @@ def main():
         wait_for(lambda: window.canvas.image is not None)
         window.grab().save(str(output / "welcome.png"))
         assert not window.export_button.isEnabled()
+        assert not window.repeat_button.isEnabled() and not window.repeat_button.isChecked()
         window.demo_button.click()
         wait_for(lambda: window.info is not None and window._ascii_image is not None and not window._loading())
         assert window.export_button.isEnabled()
@@ -99,6 +101,29 @@ def main():
         wait_for(lambda: window.position > 3.15)
         window.play_button.click()
         assert not window.playing
+        window.repeat_button.click()
+        assert window.repeat_button.isChecked()
+        with patch("ascii_studio.window.time.monotonic", return_value=100.0):
+            window.play_button.click()
+            # Delayed timer delivery must wrap correctly even after several cycles.
+            for cycles in (1, 4):
+                window._play_origin = 100.0 - window.info.duration * cycles - 0.25
+                window._tick()
+                assert window.playing and window._play_timer.isActive()
+                assert abs(window.position - 0.25) < 0.000001
+                assert window.timeline.value() == round(0.25 / window.info.duration * 10000)
+            window.play_button.click()
+            paused_at = window.position
+            window._play_origin = 0.0
+            window._tick()
+            assert not window.playing and window.position == paused_at
+            window.play_button.click()
+            window.repeat_button.click()
+            window._play_origin = 100.0 - window.info.duration - 0.1
+            window._tick()
+            assert not window.playing and not window._play_timer.isActive()
+            assert window.position == window._end_position()
+        settle()
         window.reset_button.click()
         settle()
         assert window.detail_slider.value() == 150
@@ -126,6 +151,13 @@ def main():
         wait_for(lambda: not window._exporting())
         assert not (output / "gui-cancelled.mp4").exists()
         assert window.export_button.isEnabled()
+        with patch("ascii_studio.workers.ExportJob.run", side_effect=ExportError("Недостаточно свободного места.", "encoder diagnostics")):
+            window.start_export(output / "gui-error.mp4")
+            wait_for(lambda: not window._exporting())
+        assert errors == [("Не удалось экспортировать видео", "Недостаточно свободного места.", "encoder diagnostics")]
+        assert window.export_button.isEnabled() and window.open_button.isEnabled()
+        assert window.progress_label.text() == "Экспорт не завершён"
+        errors.clear()
         invalid = output / "invalid.mp4"
         invalid.write_bytes(b"not a video")
         window.load_video(invalid)
@@ -144,7 +176,7 @@ def main():
         assert window.info.path.name == "demo.mp4"
         assert window.export_button.isEnabled()
         window.grab().save(str(output / "after-export.png"))
-        print("PASS: auto tone, undo, cancel analysis, upscale/motion controls, welcome, import, 4K/240 FPS controls, palettes, detail, compare, seek, playback, reset, compact layout, export with audio, cancel, invalid and overlong input")
+        print("PASS: auto tone, undo, cancel analysis, upscale/motion controls, welcome, import, 4K/240 FPS controls, palettes, detail, compare, seek, playback, repeat with delayed timers, pause and repeat-off, reset, compact layout, export with audio, error diagnostics and recovery, cancel, invalid and overlong input")
         window.auto_button.click()
     finally:
         window.close()

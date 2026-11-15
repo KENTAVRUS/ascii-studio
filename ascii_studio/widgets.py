@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QComboBox, QLabel, QPushButton, QSlider, QStyle, QWidget
 
 from .theme import GOLD
@@ -30,6 +30,18 @@ def icon(kind: str, color=GOLD, size=20) -> QIcon:
         painter.setPen(QPen(QColor(color), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.drawLine(7, 5, 7, 15)
         painter.drawLine(13, 5, 13, 15)
+    elif kind == "repeat":
+        path = QPainterPath(QPointF(3, 9))
+        path.lineTo(3, 7)
+        path.quadTo(3, 5, 5, 5)
+        path.lineTo(16, 5)
+        path.moveTo(17, 11)
+        path.lineTo(17, 13)
+        path.quadTo(17, 15, 15, 15)
+        path.lineTo(4, 15)
+        painter.drawPath(path)
+        painter.drawPolyline(QPolygonF([QPointF(13, 2), QPointF(16, 5), QPointF(13, 8)]))
+        painter.drawPolyline(QPolygonF([QPointF(7, 12), QPointF(4, 15), QPointF(7, 18)]))
     elif kind == "mark":
         painter.setPen(QPen(QColor(color), 1.2))
         for row, text in enumerate(["  /\\  ", " /::\\ ", "/_  _\\"]):
@@ -139,7 +151,7 @@ class PreviewCanvas(QWidget):
             painter.setPen(QColor("#737378"))
             painter.setFont(QFont("Segoe UI", 10))
             painter.drawText(QRectF(0, self.height() - 44, self.width(), 24), Qt.AlignmentFlag.AlignCenter,
-                             "Перетащите видео сюда или выберите файл")
+                             "Перетащите фото, GIF или видео сюда")
         # Quiet viewfinder corners frame the canvas without a decorative grid.
         painter.setPen(QPen(QColor("#594b30"), 1))
         for x, y, dx, dy in [(17, 17, 1, 1), (self.width()-18, 17, -1, 1),

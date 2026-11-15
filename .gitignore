@@ -16,3 +16,14 @@ test-output/
 .codex/
 Thumbs.db
 .DS_Store
+*.part.png
+*.part.jpg
+*.part.jpeg
+*.part.webp
+*.part.bmp
+*.part.tiff
+*.part.gif
+*.part.mov
+*.part.mkv
+*.part.webm
+*.part.avi
